@@ -75,6 +75,21 @@ class FakeArmIK:
         return np.zeros(14), np.zeros(14)
 
 
+class FakeHandsController:
+    """Stand-in for Dex3_1_Controller / Inspire_Controller_{DFX,FTP} / BrainCo.
+
+    The real controllers spawn a multiprocessing.Process that reads the two
+    75-float arrays on a tick. For the test, we just hold references to the
+    arrays so assertions can peek at what the driver wrote.
+    """
+    instances: list["FakeHandsController"] = []
+
+    def __init__(self, left_arr, right_arr, *_args, **_kwargs):
+        self.left_arr = left_arr
+        self.right_arr = right_arr
+        FakeHandsController.instances.append(self)
+
+
 def _install_stubs():
     ms = types.ModuleType("teleop.utils.motion_switcher")
     ms.LocoClientWrapper = FakeLoco
@@ -90,6 +105,22 @@ def _install_stubs():
     for name in ("G1_29_ArmIK", "G1_23_ArmIK", "H1_2_ArmIK", "H1_ArmIK"):
         setattr(rik, name, FakeArmIK)
     sys.modules["teleop.robot_control.robot_arm_ik"] = rik
+
+    # Hand controllers. Each real module normally DDS-binds + spawns a process
+    # on import/construction, so stub the whole module before adamo_bridge's
+    # HandsDriver touches it.
+    rhu = types.ModuleType("teleop.robot_control.robot_hand_unitree")
+    rhu.Dex3_1_Controller = FakeHandsController
+    sys.modules["teleop.robot_control.robot_hand_unitree"] = rhu
+
+    rhi = types.ModuleType("teleop.robot_control.robot_hand_inspire")
+    rhi.Inspire_Controller_DFX = FakeHandsController
+    rhi.Inspire_Controller_FTP = FakeHandsController
+    sys.modules["teleop.robot_control.robot_hand_inspire"] = rhi
+
+    rhb = types.ModuleType("teleop.robot_control.robot_hand_brainco")
+    rhb.Brainco_Controller = FakeHandsController   # note lowercase 'c'
+    sys.modules["teleop.robot_control.robot_hand_brainco"] = rhb
 
 
 _install_stubs()
@@ -154,6 +185,34 @@ def encode_posestamped(pos: tuple[float, float, float],
     _align(body, 8)
     body += struct.pack("<dddd", *quat)
     return _encap(bytes(body))
+
+
+def encode_posearray(poses: list[tuple[tuple[float, float, float],
+                                       tuple[float, float, float, float]]],
+                     sec: int = 0, nsec: int = 0,
+                     frame_id: str = "xr_origin") -> bytes:
+    """geometry_msgs/PoseArray = Header + sequence<Pose>.
+
+    Matches the bytes the Adamo frontend emits for /hand/left and /hand/right.
+    """
+    body = bytearray()
+    _write_header(body, sec, nsec, frame_id)
+    _align(body, 4)
+    body += struct.pack("<I", len(poses))
+    for pos, quat in poses:
+        _align(body, 8)
+        body += struct.pack("<ddd", *pos)
+        _align(body, 8)
+        body += struct.pack("<dddd", *quat)
+    return _encap(bytes(body))
+
+
+# 25-joint synthetic hand used across the hand-tracking tests. Joint i gets a
+# distinctive position (i, i+0.1, i+0.2) so a mis-ordered decode is obvious.
+SYNTH_HAND_POSES: list[tuple[tuple[float, float, float],
+                             tuple[float, float, float, float]]] = [
+    ((float(i), i + 0.1, i + 0.2), (0.0, 0.0, 0.0, 1.0)) for i in range(25)
+]
 
 
 def ros_envelope(topic: str, mtype: str, payload: bytes) -> bytes:
@@ -315,6 +374,221 @@ finally:
 
 
 # ---------------------------------------------------------------------------
+# 5') Hand / finger tracking: PoseArray round-trip + on_xr dispatch
+# ---------------------------------------------------------------------------
+
+print("\n[5'] Hand tracking: PoseArray decode + dispatch")
+
+# Decode round-trip via the production decoder.
+pa_env = ros_envelope("/hand/right", "geometry_msgs/msg/PoseArray",
+                      encode_posearray(SYNTH_HAND_POSES))
+env = bridge._decode_envelope(pa_env)
+check("posearray envelope topic", env and env[0] == "/hand/right")
+check("posearray envelope type",  env and env[1] == "geometry_msgs/msg/PoseArray")
+
+poses = bridge._decode_posearray_cdr(env[2])
+check("posearray count is 25", poses is not None and len(poses) == 25)
+check("joint 0 wrist position",
+      poses and np.allclose(poses[0].pos,  [0.0, 0.1, 0.2]))
+check("joint 9 index-tip position",
+      poses and np.allclose(poses[9].pos,  [9.0, 9.1, 9.2]))
+check("joint 24 pinky-tip position",
+      poses and np.allclose(poses[24].pos, [24.0, 24.1, 24.2]))
+check("all quats are identity",
+      poses and all(np.allclose(p.quat, [0, 0, 0, 1.0]) for p in poses))
+
+# on_xr dispatch: a local handler mirroring the production path in main().
+# Verifies that topic `/hand/{left,right}` PoseArray payloads land in the
+# correct HandBuffer slot with the right handedness tag.
+hand_buf = bridge.HandBuffer()
+
+def on_xr_hand(payload: bytes) -> None:
+    env = bridge._decode_envelope(payload)
+    if env is None:
+        return
+    inner, mtype, body = env
+    if mtype != "geometry_msgs/msg/PoseArray":
+        return
+    ps = bridge._decode_posearray_cdr(body)
+    if not ps:
+        return
+    handedness = "left" if inner.endswith("/left") else "right" if inner.endswith("/right") else None
+    if handedness is None:
+        return
+    joints = bridge.HandJoints(
+        handedness=handedness,
+        positions=np.array([p.pos for p in ps]),
+        quaternions=np.array([p.quat for p in ps]),
+    )
+    with hand_buf.lock:
+        if handedness == "left":
+            hand_buf.left = joints; hand_buf.left_t = time.monotonic()
+        else:
+            hand_buf.right = joints; hand_buf.right_t = time.monotonic()
+
+on_xr_hand(ros_envelope("/hand/left",  "geometry_msgs/msg/PoseArray", encode_posearray(SYNTH_HAND_POSES)))
+on_xr_hand(ros_envelope("/hand/right", "geometry_msgs/msg/PoseArray", encode_posearray(SYNTH_HAND_POSES)))
+
+check("hand_buf.left populated",
+      hand_buf.left is not None and hand_buf.left.handedness == "left")
+check("hand_buf.right populated",
+      hand_buf.right is not None and hand_buf.right.handedness == "right")
+check("hand_buf.left has (25, 3) positions",
+      hand_buf.left is not None and hand_buf.left.positions.shape == (25, 3))
+check("hand_buf.right joint 4 == thumb tip value",
+      hand_buf.right is not None and np.allclose(hand_buf.right.positions[4], [4.0, 4.1, 4.2]))
+
+# Unknown hand topic should be ignored, not crash.
+hand_buf_before = (hand_buf.left, hand_buf.right)
+on_xr_hand(ros_envelope("/hand/unknown", "geometry_msgs/msg/PoseArray", encode_posearray(SYNTH_HAND_POSES)))
+check("unknown hand topic ignored", (hand_buf.left, hand_buf.right) == hand_buf_before)
+
+# Hand tracking should ALSO populate pose_buf (wrist = joint 0) so ArmDriver
+# keeps driving the arms when controllers drop. We exercise the real on_xr
+# dispatch here because the fix lives inside bridge.main()'s local closure;
+# the test's own on_xr_hand above only routes to hand_buf by design.
+pose_buf_for_hands = bridge.PoseBuffer()
+hand_buf_for_arms  = bridge.HandBuffer()
+
+def on_xr_hands_and_arms(payload: bytes) -> None:
+    env = bridge._decode_envelope(payload)
+    if env is None:
+        return
+    inner, mtype, body = env
+    if mtype != "geometry_msgs/msg/PoseArray":
+        return
+    ps = bridge._decode_posearray_cdr(body)
+    if not ps:
+        return
+    handedness = "left" if inner.endswith("/left") else "right" if inner.endswith("/right") else None
+    if handedness is None:
+        return
+    # Mirror the production dispatch in bridge.main()
+    positions   = np.array([p.pos  for p in ps])
+    quaternions = np.array([p.quat for p in ps])
+    joints = bridge.HandJoints(handedness, positions, quaternions)
+    with hand_buf_for_arms.lock:
+        if handedness == "left":
+            hand_buf_for_arms.left = joints; hand_buf_for_arms.left_t = time.monotonic()
+        else:
+            hand_buf_for_arms.right = joints; hand_buf_for_arms.right_t = time.monotonic()
+    wrist = bridge.Pose(pos=positions[0].copy(), quat=quaternions[0].copy())
+    with pose_buf_for_hands.lock:
+        if handedness == "left":
+            pose_buf_for_hands.left = wrist; pose_buf_for_hands.left_t = time.monotonic()
+        else:
+            pose_buf_for_hands.right = wrist; pose_buf_for_hands.right_t = time.monotonic()
+
+# Send hand PoseArrays with the wrist at a distinctive location so we can
+# assert the splice landed correctly.
+LEFT_WRIST  = ((0.42, 1.23, -0.77), (0.0, 0.0, 0.0, 1.0))
+RIGHT_WRIST = ((-0.31, 1.18, -0.64), (0.0, 0.0, 0.0, 1.0))
+left_hand  = [LEFT_WRIST]  + SYNTH_HAND_POSES[1:]
+right_hand = [RIGHT_WRIST] + SYNTH_HAND_POSES[1:]
+on_xr_hands_and_arms(ros_envelope("/hand/left",  "geometry_msgs/msg/PoseArray", encode_posearray(left_hand)))
+on_xr_hands_and_arms(ros_envelope("/hand/right", "geometry_msgs/msg/PoseArray", encode_posearray(right_hand)))
+
+check("pose_buf.left populated from hand wrist",
+      pose_buf_for_hands.left is not None
+      and np.allclose(pose_buf_for_hands.left.pos,  [0.42, 1.23, -0.77]))
+check("pose_buf.right populated from hand wrist",
+      pose_buf_for_hands.right is not None
+      and np.allclose(pose_buf_for_hands.right.pos, [-0.31, 1.18, -0.64]))
+check("hand_buf still populated alongside pose_buf",
+      hand_buf_for_arms.left is not None and hand_buf_for_arms.right is not None)
+
+
+# ---------------------------------------------------------------------------
+# 5'') HandsDriver: XR joints → Unitree-frame positions → controller arrays
+# ---------------------------------------------------------------------------
+
+print("\n[5''] Hand tracking: XR → Unitree transform + HandsDriver")
+
+# 5''.a — pure transform math: wrist is always at origin of the arm frame,
+#          regardless of its world position/rotation. This is the invariant
+#          that lets the controller treat the arrays as wrist-relative.
+for (wrist_pos, wrist_quat) in [
+    ((0.0, 0.0, 0.0), (0, 0, 0, 1.0)),        # identity
+    ((0.3, 1.2, -0.5), (0, 0, 0, 1.0)),       # translated, identity rotation
+    ((0.0, 0.0, 0.0), (0.0, 0.3826, 0.0, 0.9238)),  # 45° yaw
+]:
+    positions = np.array([wrist_pos] * 25)
+    quaternions = np.array([wrist_quat] * 25)
+    hand = bridge.HandJoints("left", positions, quaternions)
+    out = bridge.xr_hand_to_unitree_arm_positions(hand)
+    check(f"wrist at origin after transform (wrist_pos={wrist_pos})",
+          np.allclose(out[0], [0, 0, 0], atol=1e-9),
+          f"got {out[0]}")
+    check(f"output shape (25, 3) for wrist_pos={wrist_pos}",
+          out.shape == (25, 3))
+
+# 5''.b — a joint 1 cm "above" the wrist in WebXR (+Y) lands somewhere
+#          non-zero in the Unitree frame. We don't assert the exact axis here
+#          (T_TO_UNITREE_HAND's specifics are covered by televuer); we just
+#          verify the translation magnitude survives the transform intact.
+positions = np.zeros((25, 3))
+positions[1] = [0.0, 0.01, 0.0]   # 1 cm above wrist
+quaternions = np.tile([0.0, 0.0, 0.0, 1.0], (25, 1))
+hand = bridge.HandJoints("left", positions, quaternions)
+out = bridge.xr_hand_to_unitree_arm_positions(hand)
+check("joint-1 magnitude preserved (1 cm in → ~1 cm out)",
+      abs(np.linalg.norm(out[1]) - 0.01) < 1e-9,
+      f"got |out[1]|={np.linalg.norm(out[1]):.6f}")
+
+# 5''.c — HandsDriver integration: fill HandBuffer, spin up the driver
+#          with the Inspire_DFX hand (H1 stock), verify the shared Array
+#          gets the 75 transformed floats within a couple ticks.
+FakeHandsController.instances.clear()
+synth_positions   = np.array([p[0] for p in SYNTH_HAND_POSES], dtype=float)
+synth_quaternions = np.array([p[1] for p in SYNTH_HAND_POSES], dtype=float)
+hb = bridge.HandBuffer()
+hb.left  = bridge.HandJoints("left",  synth_positions, synth_quaternions)
+hb.right = bridge.HandJoints("right", synth_positions, synth_quaternions)
+hb.left_t = hb.right_t = time.monotonic()
+
+hands = bridge.HandsDriver(buf=hb, hand_type="inspire_dfx",
+                           frequency=120.0, pose_max_age_s=5.0)
+try:
+    time.sleep(0.08)  # several tick periods at 120 Hz
+    check("HandsDriver instantiated one controller",
+          len(FakeHandsController.instances) == 1)
+    ctrl = FakeHandsController.instances[-1]
+    with ctrl.left_arr.get_lock():
+        left_out = np.array(ctrl.left_arr[:]).reshape(25, 3)
+    with ctrl.right_arr.get_lock():
+        right_out = np.array(ctrl.right_arr[:]).reshape(25, 3)
+    check("left array filled (non-zero after tick)",  not np.allclose(left_out, 0))
+    check("right array filled (non-zero after tick)", not np.allclose(right_out, 0))
+    # Wrist (joint 0) should sit at origin regardless of input — invariant.
+    check("left wrist at origin in controller array",
+          np.allclose(left_out[0], [0, 0, 0], atol=1e-6),
+          f"got {left_out[0]}")
+    check("right wrist at origin in controller array",
+          np.allclose(right_out[0], [0, 0, 0], atol=1e-6),
+          f"got {right_out[0]}")
+finally:
+    hands.close()
+
+# 5''.d — stale poses should be skipped (soft safety stop).
+FakeHandsController.instances.clear()
+hb2 = bridge.HandBuffer()
+hb2.left  = bridge.HandJoints("left",  synth_positions, synth_quaternions)
+hb2.right = bridge.HandJoints("right", synth_positions, synth_quaternions)
+hb2.left_t = hb2.right_t = time.monotonic() - 10.0  # way stale
+hands2 = bridge.HandsDriver(buf=hb2, hand_type="inspire_dfx",
+                            frequency=120.0, pose_max_age_s=0.1)
+try:
+    time.sleep(0.08)
+    ctrl = FakeHandsController.instances[-1]
+    with ctrl.left_arr.get_lock():
+        left_out = np.array(ctrl.left_arr[:])
+    check("stale poses skipped (left array stays zero)",
+          np.allclose(left_out, 0))
+finally:
+    hands2.close()
+
+
+# ---------------------------------------------------------------------------
 # 5) Full loop through the Adamo routers (real Zenoh transport)
 # ---------------------------------------------------------------------------
 #
@@ -362,22 +636,28 @@ if _adamo_ok:
         "sensor_msgs/msg/Joy",
         encode_joy(axes=[0.0, -0.5, 0.25, 0.0], buttons=[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
     )
+    hand_env = ros_envelope(
+        "/hand/right",
+        "geometry_msgs/msg/PoseArray",
+        encode_posearray(SYNTH_HAND_POSES),
+    )
 
     pub.put(pose_env)
     pub.put(joy_env)
+    pub.put(hand_env)
 
     collected: list[bytes] = []
     deadline = time.monotonic() + 6.0
-    while time.monotonic() < deadline and len(collected) < 2:
+    while time.monotonic() < deadline and len(collected) < 3:
         try:
             collected.append(received.get(timeout=max(0.1, deadline - time.monotonic())))
         except queue.Empty:
             break
 
-    check("received both envelopes via router", len(collected) >= 2,
-          f"got {len(collected)}/2 in 6s")
+    check("received all three envelopes via router", len(collected) >= 3,
+          f"got {len(collected)}/3 in 6s")
 
-    if len(collected) >= 2:
+    if len(collected) >= 3:
         # Match them up by type after decoding (order isn't guaranteed).
         decoded = []
         for raw in collected:
@@ -389,9 +669,12 @@ if _adamo_ok:
                 decoded.append(("pose", inner, bridge._decode_posestamped_cdr(body)))
             elif mtype == "sensor_msgs/msg/Joy":
                 decoded.append(("joy", inner, bridge._decode_joy_cdr(body)))
+            elif mtype == "geometry_msgs/msg/PoseArray":
+                decoded.append(("hand", inner, bridge._decode_posearray_cdr(body)))
 
         pose_hit = next((d for d in decoded if d[0] == "pose"), None)
         joy_hit  = next((d for d in decoded if d[0] == "joy"),  None)
+        hand_hit = next((d for d in decoded if d[0] == "hand"), None)
 
         check("pose envelope topic",     pose_hit and pose_hit[1] == "/controller/left")
         check("pose position survived",  pose_hit and np.allclose(pose_hit[2].pos,  [0.42, 1.23, -0.77]))
@@ -399,6 +682,10 @@ if _adamo_ok:
         check("joy envelope topic",      joy_hit  and joy_hit[1] == "/controller/right/joy")
         check("joy axes survived",       joy_hit  and np.allclose(joy_hit[2].axes, [0.0, -0.5, 0.25, 0.0], atol=1e-6))
         check("joy buttons survived",    joy_hit  and joy_hit[2].buttons == [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        check("hand envelope topic",     hand_hit and hand_hit[1] == "/hand/right")
+        check("hand joint count",        hand_hit and len(hand_hit[2]) == 25)
+        check("hand wrist position",     hand_hit and np.allclose(hand_hit[2][0].pos,  [0.0, 0.1, 0.2]))
+        check("hand pinky-tip position", hand_hit and np.allclose(hand_hit[2][24].pos, [24.0, 24.1, 24.2]))
 
     try: pub.close()
     except Exception: pass

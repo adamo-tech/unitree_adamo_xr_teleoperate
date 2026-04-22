@@ -149,6 +149,26 @@ def _decode_posestamped_cdr(payload: bytes) -> Optional[Pose]:
     return Pose(pos=np.array([px, py, pz]), quat=np.array([qx, qy, qz, qw]))
 
 
+def _decode_posearray_cdr(payload: bytes) -> Optional[list[Pose]]:
+    """geometry_msgs/PoseArray = Header + sequence<Pose>.
+
+    Returned list order matches the publisher's order. For hand tracking the
+    Adamo frontend uses the fixed 25-element HAND_JOINT_NAMES order; see
+    @adamo/media for the list (wrist, thumb-*, index-*, …, pinky-*).
+    """
+    r = _cdr_from_payload(payload)
+    if r is None:
+        return None
+    r.skip_header()
+    n = r.u32()
+    poses: list[Pose] = []
+    for _ in range(n):
+        px = r.f64(); py = r.f64(); pz = r.f64()
+        qx = r.f64(); qy = r.f64(); qz = r.f64(); qw = r.f64()
+        poses.append(Pose(pos=np.array([px, py, pz]), quat=np.array([qx, qy, qz, qw])))
+    return poses
+
+
 def _decode_joy_json(payload: bytes) -> Optional[Joy]:
     if payload[:1] != b"{":
         return None
@@ -180,6 +200,89 @@ _XR_TO_ROBOT_R = np.array([
     [-1.0,  0.0,  0.0],
     [ 0.0,  1.0,  0.0],
 ])
+
+
+# ---------------------------------------------------------------------------
+# Hand-tracking coordinate transforms
+# ---------------------------------------------------------------------------
+#
+# Mirrors televuer/tv_wrapper.py's transform chain (we don't go through
+# televuer because our source is Adamo/WebXR, but the Dex3/Inspire/BrainCo
+# controllers all expect positions in the same final frame). See
+# unitreerobotics/televuer for the derivations — we just apply the same
+# matrices to keep retargeting behaviour identical.
+
+T_ROBOT_OPENXR = np.array([
+    [ 0,  0, -1, 0],
+    [-1,  0,  0, 0],
+    [ 0,  1,  0, 0],
+    [ 0,  0,  0, 1],
+], dtype=float)
+
+T_OPENXR_ROBOT = np.array([
+    [ 0, -1,  0, 0],
+    [ 0,  0,  1, 0],
+    [-1,  0,  0, 0],
+    [ 0,  0,  0, 1],
+], dtype=float)
+
+T_TO_UNITREE_HAND = np.array([
+    [ 0,  0,  1, 0],
+    [-1,  0,  0, 0],
+    [ 0, -1,  0, 0],
+    [ 0,  0,  0, 1],
+], dtype=float)
+
+
+def _fast_mat_inv(T: np.ndarray) -> np.ndarray:
+    """Inverse of a 4x4 rigid transform (rotation + translation)."""
+    out = np.eye(4)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    out[:3, :3] = R.T
+    out[:3, 3] = -R.T @ t
+    return out
+
+
+def xr_hand_to_unitree_arm_positions(hand: HandJoints) -> np.ndarray:
+    """Transform 25 WebXR hand-joint positions into the frame Dex3/Inspire/
+    BrainCo controllers expect: arm-relative, Unitree URDF hand convention,
+    units metres, shape (25, 3). Joint order is preserved (WebXR native).
+
+    Steps, matching televuer (tv_wrapper.py lines ~260-344):
+      1. Build the wrist pose (joint 0) as a 4x4 in the OpenXR basis.
+      2. Similarity-transform the wrist pose into the Robot basis.
+      3. Change-basis all 25 joint positions OpenXR → Robot.
+      4. Express joint positions in the wrist/arm frame (invert the wrist pose).
+      5. Apply T_TO_UNITREE_HAND to align with the Unitree hand URDF axes
+         (x: palm→back, y: fingertip→wrist, z: pinky→index for the left hand).
+    """
+    if hand.positions.shape != (25, 3) or hand.quaternions.shape != (25, 4):
+        # Short/ragged input — zero out. Upstream should already guarantee
+        # 25 joints, but don't crash the driver on an unexpected payload.
+        return np.zeros((25, 3))
+
+    # (1) Wrist pose in OpenXR basis.
+    wrist_R = _quat_to_rot(hand.quaternions[0])
+    wrist_p = hand.positions[0]
+    Bxr_world_arm = np.eye(4)
+    Bxr_world_arm[:3, :3] = wrist_R
+    Bxr_world_arm[:3, 3] = wrist_p
+
+    # (2) Wrist pose in Robot basis.
+    Brobot_world_arm = T_ROBOT_OPENXR @ Bxr_world_arm @ T_OPENXR_ROBOT
+
+    # (3) Joint positions in OpenXR basis → Robot basis.
+    n = hand.positions.shape[0]   # 25
+    Bxr_world_hand = np.concatenate([hand.positions.T, np.ones((1, n))])   # (4, 25)
+    Brobot_world_hand = T_ROBOT_OPENXR @ Bxr_world_hand
+
+    # (4) World → arm frame (using the pre-Unitree-remap wrist pose per televuer).
+    Brobot_arm_hand = _fast_mat_inv(Brobot_world_arm) @ Brobot_world_hand
+
+    # (5) Apply Unitree hand axis remap.
+    Bunitree_arm_hand = (T_TO_UNITREE_HAND @ Brobot_arm_hand)[:3, :].T     # (25, 3)
+    return Bunitree_arm_hand
 
 
 def _quat_to_rot(q: np.ndarray) -> np.ndarray:
@@ -273,6 +376,32 @@ class PoseBuffer:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+@dataclass
+class HandJoints:
+    """25 hand joint poses in the WebXR xr_origin frame.
+
+    Index order is fixed (see HAND_JOINT_NAMES in @adamo/media):
+      0      = wrist
+      1..4   = thumb (metacarpal, proximal, distal, tip)
+      5..9   = index (metacarpal, proximal, intermediate, distal, tip)
+      10..14 = middle (same pattern)
+      15..19 = ring
+      20..24 = pinky
+    """
+    handedness: str          # "left" or "right"
+    positions: np.ndarray    # (25, 3) xyz in metres, xr_origin frame
+    quaternions: np.ndarray  # (25, 4) (x, y, z, w)
+
+
+@dataclass
+class HandBuffer:
+    left: Optional[HandJoints] = None
+    right: Optional[HandJoints] = None
+    left_t: float = 0.0
+    right_t: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class ArmDriver:
     """Owns IK + arm controller. Runs the IK loop at a fixed frequency."""
 
@@ -322,6 +451,110 @@ class ArmDriver:
                         self.ctrl.ctrl_dual_arm(sol_q, sol_tauff)
                     except Exception as e:
                         log.warning("IK step failed: %s", e)
+            dt = time.monotonic() - t0
+            if dt < period:
+                time.sleep(period - dt)
+
+    def close(self) -> None:
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
+# XR hand joints → Inspire / Dex3 / BrainCo finger controllers
+# ---------------------------------------------------------------------------
+
+
+class HandsDriver:
+    """Consumes HandBuffer and drives the Unitree hand controller of your choice.
+
+    Each tick: pull the latest joint sets, run them through
+    xr_hand_to_unitree_arm_positions(), flatten to 75 floats, and write under
+    the shared Array lock the controller is reading from in its own process.
+
+    hand_type is the same naming xr_teleoperate's --ee flag uses:
+      * "dex3"         → robot_hand_unitree.Dex3_1_Controller
+      * "inspire_dfx"  → robot_hand_inspire.Inspire_Controller_DFX
+      * "inspire_ftp"  → robot_hand_inspire.Inspire_Controller_FTP
+      * "brainco"      → robot_hand_brainco.BrainCo_Controller  (if installed)
+    """
+
+    SUPPORTED = ("dex3", "inspire_dfx", "inspire_ftp", "brainco")
+
+    def __init__(self, buf: HandBuffer, hand_type: str, frequency: float = 60.0,
+                 pose_max_age_s: float = 0.25, simulation_mode: bool = False):
+        if hand_type not in self.SUPPORTED:
+            raise ValueError(f"hand_type must be one of {self.SUPPORTED}")
+
+        from multiprocessing import Array, Lock as MPLock
+        self.left_arr  = Array('d', 75, lock=True)
+        self.right_arr = Array('d', 75, lock=True)
+        state_lock = MPLock()
+
+        # Per-hand state/action buffer size differs by controller:
+        #   Dex3:             14 (7 DOF × 2 hands)
+        #   Inspire DFX/FTP:  12 (6 DOF × 2 hands)
+        #   Brainco:          12
+        # Values taken from xr_teleoperate/teleop/teleop_hand_and_arm.py lines ~160-200.
+        state_size = 14 if hand_type == "dex3" else 12
+        self.state  = Array('d', state_size, lock=False)
+        self.action = Array('d', state_size, lock=False)
+
+        if hand_type == "dex3":
+            from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
+            self.ctrl = Dex3_1_Controller(
+                self.left_arr, self.right_arr, state_lock,
+                self.state, self.action, simulation_mode=simulation_mode,
+            )
+        elif hand_type == "inspire_dfx":
+            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX
+            self.ctrl = Inspire_Controller_DFX(
+                self.left_arr, self.right_arr, state_lock,
+                self.state, self.action, simulation_mode=simulation_mode,
+            )
+        elif hand_type == "inspire_ftp":
+            from teleop.robot_control.robot_hand_inspire import Inspire_Controller_FTP
+            self.ctrl = Inspire_Controller_FTP(
+                self.left_arr, self.right_arr, state_lock,
+                self.state, self.action, simulation_mode=simulation_mode,
+            )
+        else:  # brainco — note the class is Brainco_Controller (lowercase 'c'),
+               # not BrainCo_Controller. Matches robot_hand_brainco.py:21.
+            from teleop.robot_control.robot_hand_brainco import Brainco_Controller
+            self.ctrl = Brainco_Controller(
+                self.left_arr, self.right_arr, state_lock,
+                self.state, self.action, simulation_mode=simulation_mode,
+            )
+
+        self._buf = buf
+        self._freq = frequency
+        self._max_age = pose_max_age_s
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, name="hands-loop", daemon=True).start()
+
+    def _run(self) -> None:
+        period = 1.0 / max(1e-3, self._freq)
+        log.info("hands driver running @ %.1f Hz", self._freq)
+        while not self._stop.is_set():
+            t0 = time.monotonic()
+            with self._buf.lock:
+                left  = self._buf.left
+                right = self._buf.right
+                lt, rt = self._buf.left_t, self._buf.right_t
+            now = time.monotonic()
+            if left is not None and now - lt < self._max_age:
+                try:
+                    flat = xr_hand_to_unitree_arm_positions(left).flatten()
+                    with self.left_arr.get_lock():
+                        self.left_arr[:] = flat
+                except Exception as e:
+                    log.warning("left hand transform failed: %s", e)
+            if right is not None and now - rt < self._max_age:
+                try:
+                    flat = xr_hand_to_unitree_arm_positions(right).flatten()
+                    with self.right_arr.get_lock():
+                        self.right_arr[:] = flat
+                except Exception as e:
+                    log.warning("right hand transform failed: %s", e)
             dt = time.monotonic() - t0
             if dt < period:
                 time.sleep(period - dt)
@@ -384,6 +617,20 @@ def main() -> int:
                    help="Additive offset (metres, robot frame) applied to XR poses "
                         "— shifts the operator 'neutral' point into the robot's arm workspace")
 
+    # hand / finger tracking (opt-in)
+    p.add_argument("--enable-hands", action="store_true",
+                   help="Drive the Unitree hand controller from XR hand tracking "
+                        "(requires the frontend 'Hand / Finger Tracking' toggle on)")
+    p.add_argument("--hand-type", choices=HandsDriver.SUPPORTED, default="inspire_dfx",
+                   help="Which Unitree hand controller to instantiate — matches "
+                        "xr_teleoperate's --ee flag. H1 stock = inspire_dfx.")
+    p.add_argument("--hand-frequency", type=float, default=60.0,
+                   help="Rate at which the hands driver pushes retargeted positions "
+                        "into the controller's shared array")
+    p.add_argument("--hand-pose-max-age-s", type=float, default=0.25,
+                   help="Stop writing positions if the hand hasn't been updated in "
+                        "this long (soft safety stop when tracking is lost)")
+
     args = p.parse_args()
 
     if not args.robot_name:
@@ -429,6 +676,19 @@ def main() -> int:
             buf=pose_buf,
         )
 
+    # -- hand / finger tracking (25 joints/hand PoseArray from the Adamo frontend) --
+    hand_buf = HandBuffer()
+    hands = None
+    if args.enable_hands:
+        hands = HandsDriver(
+            buf=hand_buf,
+            hand_type=args.hand_type,
+            frequency=args.hand_frequency,
+            pose_max_age_s=args.hand_pose_max_age_s,
+            simulation_mode=args.sim,
+        )
+        log.info("hands driver up: type=%s @ %.1f Hz", args.hand_type, args.hand_frequency)
+
     # -- control subscribers --
     seen_xr = {"count": 0, "topics": set()}
 
@@ -468,6 +728,51 @@ def main() -> int:
                 loco.on_joy(joy)
             elif src == "left" and "left" in inner_topic:
                 loco.on_joy(joy)
+            return
+
+        if mtype == "geometry_msgs/msg/PoseArray":
+            # Hand tracking — 25 joints per hand in fixed HAND_JOINT_NAMES order.
+            # Topic is /hand/left or /hand/right (see XRTrackingData.hands in
+            # @adamo/media).
+            poses = _decode_posearray_cdr(body)
+            if not poses:
+                return
+            handedness: Optional[str] = None
+            if inner_topic.endswith("/left"):
+                handedness = "left"
+            elif inner_topic.endswith("/right"):
+                handedness = "right"
+            if handedness is None:
+                return
+            # Accept any count; the frontend currently sends 25 but downstream
+            # consumers should index joints by position and handle short arrays.
+            positions = np.array([p.pos for p in poses])
+            quaternions = np.array([p.quat for p in poses])
+            joints = HandJoints(
+                handedness=handedness,
+                positions=positions,
+                quaternions=quaternions,
+            )
+            now = time.monotonic()
+            with hand_buf.lock:
+                if handedness == "left":
+                    hand_buf.left = joints; hand_buf.left_t = now
+                else:
+                    hand_buf.right = joints; hand_buf.right_t = now
+
+            # Also drive the arm IK from hand-tracking: joint 0 of each hand
+            # IS the wrist pose in the same xr_origin frame the controller
+            # topics use. When hand tracking is on, WebXR drops controllers,
+            # so without this ArmDriver would go quiet. pose_buf.{left,right}
+            # are kept in WebXR (not Unitree) frame — ArmDriver applies
+            # pose_to_robot_tf itself.
+            wrist = Pose(pos=positions[0].copy(), quat=quaternions[0].copy())
+            with pose_buf.lock:
+                if handedness == "left":
+                    pose_buf.left = wrist; pose_buf.left_t = now
+                else:
+                    pose_buf.right = wrist; pose_buf.right_t = now
+            return
 
     def on_gamepad(payload: bytes) -> None:
         # @adamo/teleop JoypadManager: CDR-with-envelope by default, JSON optional.
@@ -515,6 +820,7 @@ def main() -> int:
     finally:
         if arm: arm.close()
         if loco: loco.close()
+        if hands: hands.close()
         try: alive.undeclare()
         except Exception: pass
         robot.close()
