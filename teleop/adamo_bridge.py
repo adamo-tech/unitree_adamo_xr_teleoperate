@@ -564,6 +564,119 @@ class HandsDriver:
 
 
 # ---------------------------------------------------------------------------
+# --camera spec parser
+# ---------------------------------------------------------------------------
+
+
+_CAMERA_SOURCES      = ("device", "shm", "pipeline")
+_CAMERA_OPTION_KEYS  = {"name", "width", "height", "fps", "bitrate",
+                        "codec", "pixel_format", "keyframe_distance"}
+_CAMERA_INT_KEYS     = {"width", "height", "fps", "bitrate"}
+_CAMERA_FLOAT_KEYS   = {"keyframe_distance"}
+
+
+def _split_on_unescaped_commas(spec: str) -> list[str]:
+    out, buf, i = [], "", 0
+    while i < len(spec):
+        if spec[i] == "\\" and i + 1 < len(spec) and spec[i + 1] == ",":
+            buf += ","; i += 2; continue
+        if spec[i] == ",":
+            out.append(buf); buf = ""; i += 1; continue
+        buf += spec[i]; i += 1
+    out.append(buf)
+    return out
+
+
+def parse_camera_spec(spec: str) -> dict:
+    """Parse one --camera spec into Robot.attach_video kwargs.
+
+    First token is the source binding — one of::
+
+        device=/dev/video0      device:/dev/video0
+        shm=camera/head         shm:/head
+        pipeline=...
+
+    `:` and `=` are both accepted after the source word (so `shm:/head`
+    and `shm=/head` are equivalent). Subsequent comma-separated tokens are
+    options: width, height, fps, bitrate, codec, pixel_format,
+    keyframe_distance, or an explicit name= override.
+
+    Track name is auto-derived from the last path component of the source
+    value when not given — `device=/dev/video0` becomes `video0`,
+    `shm=camera/left_wrist` becomes `left_wrist`. Must be set explicitly
+    for `pipeline=` (no sensible default from a GStreamer string).
+
+    Commas inside gstreamer pipelines must be escaped as ``\\,``.
+
+    Examples::
+
+        device=/dev/video0
+        shm:/head
+        shm=camera/left_wrist,width=640,height=480,fps=30
+        pipeline=videotestsrc pattern=ball,name=test,width=640,height=480
+    """
+    parts = _split_on_unescaped_commas(spec)
+    if not parts or not parts[0].strip():
+        raise ValueError("empty --camera spec")
+
+    # First token: source binding. Accept either '=' or ':' for this one.
+    head = parts[0].strip()
+    sep_positions = [head.index(c) for c in "=:" if c in head]
+    if not sep_positions:
+        raise ValueError(
+            f"camera spec: first token must be 'source=path' or 'source:path', got {head!r}")
+    sep = min(sep_positions)
+    src_key = head[:sep].strip()
+    src_val = head[sep + 1:].strip()
+    if src_key not in _CAMERA_SOURCES:
+        raise ValueError(
+            f"camera spec: source must be one of {_CAMERA_SOURCES}, got {src_key!r}")
+    if not src_val:
+        raise ValueError(f"camera spec: {src_key}= requires a value")
+
+    out: dict = {src_key: src_val}
+
+    # Remaining tokens: key=value options.
+    for chunk in parts[1:]:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise ValueError(f"camera option must be key=value, got {chunk!r}")
+        k, v = chunk.split("=", 1)
+        k = k.strip(); v = v.strip()
+        if k in _CAMERA_SOURCES:
+            raise ValueError(
+                f"camera spec: source ({k}=) must be the first token, not an option")
+        if k not in _CAMERA_OPTION_KEYS:
+            raise ValueError(
+                f"camera spec: unknown option {k!r}. allowed: {sorted(_CAMERA_OPTION_KEYS)}")
+        if k in _CAMERA_INT_KEYS:
+            v = int(v)
+        elif k in _CAMERA_FLOAT_KEYS:
+            v = float(v)
+        out[k] = v
+
+    # Auto-derive name from the source path if not set.
+    if "name" not in out:
+        if src_key == "pipeline":
+            raise ValueError(
+                "camera spec: name= is required when pipeline= is used "
+                "(can't auto-derive a track name from a GStreamer string)")
+        basename = src_val.strip("/").split("/")[-1]
+        if not basename:
+            raise ValueError(
+                f"camera spec: can't auto-derive name from {src_key}={src_val!r}; "
+                "pass name= explicitly")
+        out["name"] = basename
+
+    # attach_video uses bitrate_kbps; the CLI accepts the shorter 'bitrate'.
+    if "bitrate" in out:
+        out["bitrate_kbps"] = out.pop("bitrate")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -581,14 +694,19 @@ def main() -> int:
     p.add_argument("--sim", action="store_true",
                    help="Use DDS domain 1 (Isaac sim) instead of 0")
 
-    # cameras
-    p.add_argument("--head", default=None, help="head camera device path or index")
-    p.add_argument("--left-wrist", default=None)
-    p.add_argument("--right-wrist", default=None)
-    p.add_argument("--width", type=int, default=1280)
-    p.add_argument("--height", type=int, default=720)
-    p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--bitrate-kbps", type=int, default=4000)
+    # cameras — repeat --camera for each track. First token is the source:
+    #   --camera device=/dev/video0                 (→ name auto-derived: 'video0')
+    #   --camera shm:/head                          (→ name 'head')
+    #   --camera shm=camera/left_wrist,width=640,height=480,fps=30
+    #   --camera pipeline=videotestsrc pattern=ball,name=test
+    # Extra options after the first comma: name, width, height, fps, bitrate,
+    # codec, pixel_format, keyframe_distance. Escape commas inside gstreamer
+    # pipelines as '\\,' so they survive the split.
+    p.add_argument("--camera", action="append", default=[], metavar="SPEC",
+                   help="Camera spec: '<source>=<path>[,key=val,...]'. "
+                        "Source is one of device / shm / pipeline. "
+                        "Name auto-derives from the path; pass name=X to override. "
+                        "Repeat --camera for multiple tracks.")
 
     # control — XR tracking is the primary channel; gamepad joy channel optional
     p.add_argument("--xr-channel", default="cdr/xr_tracking",
@@ -646,21 +764,18 @@ def main() -> int:
 
     robot = adamo.Robot(api_key=args.api_key, name=args.robot_name, protocol=args.protocol)
 
-    # -- video --
+    # -- video -- parse + attach every --camera spec. Rust side runs the
+    # encoder thread; frames never cross back into Python.
     attached_cams: list[str] = []
-    for track, device in [("head", args.head),
-                          ("left_wrist", args.left_wrist),
-                          ("right_wrist", args.right_wrist)]:
-        if not device:
-            continue
-        robot.attach_video(
-            track, device=device,
-            width=args.width, height=args.height,
-            fps=args.fps, bitrate_kbps=args.bitrate_kbps,
-        )
-        attached_cams.append(track)
-        log.info("video track '%s' attached @ %dx%d/%dfps from %s",
-                 track, args.width, args.height, args.fps, device)
+    for spec in args.camera:
+        try:
+            kw = parse_camera_spec(spec)
+        except ValueError as e:
+            print(f"error: bad --camera spec {spec!r}: {e}", file=sys.stderr); return 2
+        name = kw.pop("name")
+        robot.attach_video(name, **kw)
+        attached_cams.append(name)
+        log.info("video track '%s' attached: %s", name, kw)
 
     # -- locomotion --
     loco = LocoDriver(args.speed_scale, args.control_timeout) if args.locomotion_source != "off" else None

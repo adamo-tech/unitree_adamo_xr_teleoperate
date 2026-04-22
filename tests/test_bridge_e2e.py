@@ -589,6 +589,54 @@ finally:
 
 
 # ---------------------------------------------------------------------------
+# 5''') --camera spec parser
+# ---------------------------------------------------------------------------
+
+print("\n[5'''] --camera spec parser")
+
+# Happy paths — auto-derive name from the source path.
+cases = [
+    ("device=/dev/video0",                        {"device": "/dev/video0", "name": "video0"}),
+    ("shm:/head",                                 {"shm": "/head", "name": "head"}),
+    ("shm=camera/left_wrist",                     {"shm": "camera/left_wrist", "name": "left_wrist"}),
+    ("device=/dev/video2,width=640,height=480,fps=30,bitrate=3000",
+     {"device": "/dev/video2", "name": "video2",
+      "width": 640, "height": 480, "fps": 30, "bitrate_kbps": 3000}),
+    ("shm=camera/head,name=front,pixel_format=BGRA",
+     {"shm": "camera/head", "name": "front", "pixel_format": "BGRA"}),
+    ("pipeline=videotestsrc is-live=true pattern=ball,name=test,width=640",
+     {"pipeline": "videotestsrc is-live=true pattern=ball", "name": "test", "width": 640}),
+]
+for spec, expected in cases:
+    got = bridge.parse_camera_spec(spec)
+    check(f"parse {spec!r}", got == expected, f"got {got}")
+
+# Escaping commas inside a gstreamer pipeline.
+got = bridge.parse_camera_spec(
+    "pipeline=videotestsrc ! capsfilter caps=video/x-raw\\,format=NV12,name=t")
+check("pipeline with escaped comma survives split",
+      got == {"pipeline": "videotestsrc ! capsfilter caps=video/x-raw,format=NV12",
+              "name": "t"})
+
+# Error paths.
+def expect_error(spec: str, substr: str) -> None:
+    try:
+        bridge.parse_camera_spec(spec)
+        check(f"error raised: {spec!r}", False, "no exception")
+    except ValueError as e:
+        check(f"error on {spec!r} mentions {substr!r}",
+              substr in str(e), f"got: {e}")
+
+expect_error("",                             "empty")
+expect_error("nope",                         "first token")
+expect_error("garbage=value",                "source must be one of")
+expect_error("pipeline=videotestsrc",        "name=")       # no auto-name for pipeline
+expect_error("device=/dev/video0,bogus=1",   "unknown option")
+expect_error("device=/dev/video0,shm=x",     "must be the first token")
+expect_error("ros=/topic",                   "source must be one of")   # ROS removed
+
+
+# ---------------------------------------------------------------------------
 # 5) Full loop through the Adamo routers (real Zenoh transport)
 # ---------------------------------------------------------------------------
 #
