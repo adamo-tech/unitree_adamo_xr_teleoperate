@@ -688,7 +688,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--robot-name", default=os.environ.get("ADAMO_ROBOT"))
     p.add_argument("--api-key", default=os.environ.get("ADAMO_API_KEY"))
-    p.add_argument("--protocol", default="udp", choices=["udp", "quic", "tcp"])
+    p.add_argument("--protocol", default="quic", choices=["quic", "udp", "tcp"])
     p.add_argument("--network-interface", default=None,
                    help="Interface for Unitree DDS (e.g. eth0)")
     p.add_argument("--sim", action="store_true",
