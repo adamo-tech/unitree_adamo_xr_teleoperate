@@ -6,3 +6,4 @@ adamo>=0.4.15
 dex-retargeting<0.5
 logging_mp
 casadi
+pin
