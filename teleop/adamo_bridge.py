@@ -570,7 +570,7 @@ class HandsDriver:
 
 _CAMERA_SOURCES      = ("device", "shm", "pipeline")
 _CAMERA_OPTION_KEYS  = {"name", "width", "height", "fps", "bitrate",
-                        "codec", "pixel_format", "keyframe_distance"}
+                        "codec", "encoder", "pixel_format", "keyframe_distance"}
 _CAMERA_INT_KEYS     = {"width", "height", "fps", "bitrate"}
 _CAMERA_FLOAT_KEYS   = {"keyframe_distance"}
 
