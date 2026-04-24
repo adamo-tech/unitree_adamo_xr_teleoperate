@@ -3,4 +3,4 @@ rerun-sdk==0.20.1
 meshcat==0.3.2
 sshkeyboard==2.3.1
 adamo>=0.4.15
-dex-retargeting
+dex-retargeting<0.5
