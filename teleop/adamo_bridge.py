@@ -807,8 +807,8 @@ def main() -> int:
     # -- control subscribers --
     seen_xr = {"count": 0, "topics": set()}
 
-    def on_xr(payload: bytes) -> None:
-        env = _decode_envelope(payload)
+    def on_xr(sample) -> None:
+        env = _decode_envelope(sample.payload)
         if env is None:
             return
         inner_topic, mtype, body = env
@@ -889,8 +889,9 @@ def main() -> int:
                     pose_buf.right = wrist; pose_buf.right_t = now
             return
 
-    def on_gamepad(payload: bytes) -> None:
+    def on_gamepad(sample) -> None:
         # @adamo/teleop JoypadManager: CDR-with-envelope by default, JSON optional.
+        payload = sample.payload
         joy = _decode_joy_json(payload)
         if joy is None:
             env = _decode_envelope(payload)
