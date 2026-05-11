@@ -345,12 +345,13 @@ print("\n[4] ArmDriver: wrist poses → arm_ik.solve_ik → arm_ctrl.ctrl_dual_a
 pose_buf2 = bridge.PoseBuffer()
 pose_buf2.left  = bridge.Pose(pos=np.array([0.2, 1.0, -0.4]), quat=np.array([0, 0, 0, 1.0]))
 pose_buf2.right = bridge.Pose(pos=np.array([-0.2, 1.0, -0.4]), quat=np.array([0, 0, 0, 1.0]))
-pose_buf2.left_t = pose_buf2.right_t = time.monotonic()
+pose_buf2.head = bridge.Pose(pos=np.array([0.0, 1.7, 0.0]), quat=np.array([0, 0, 0, 1.0]))
+pose_buf2.left_t = pose_buf2.right_t = pose_buf2.head_t = time.monotonic()
 
 arm = bridge.ArmDriver(
     arm="G1_29", motion=False, sim=False,
     frequency=30.0, pose_max_age_s=1.0,
-    origin_offset=np.array([0.25, 0.0, 0.1]),
+    origin_offset=np.array([0.15, 0.0, 0.45]),
     buf=pose_buf2,
 )
 try:
@@ -359,16 +360,18 @@ try:
     check("ctrl.ctrl_dual_arm called", len(arm.ctrl.ctrl_calls) > 0)
 
     # Verify the input transforms to IK have the expected shape + frame mapping.
-    # WebXR (0, 1.0, -0.4) with our remap (robot_x = -xr_z, robot_y = -xr_x, robot_z = xr_y)
-    # + origin offset (0.25, 0, 0.1) should give right wrist at:
-    #   x = -(-0.4) + 0.25 = 0.65
+    # Right wrist uses the controller position relative to the head:
+    #   controller - head = (-0.2, -0.7, -0.4)
+    # with remap (robot_x = -xr_z, robot_y = -xr_x, robot_z = xr_y)
+    # + origin offset (0.15, 0, 0.45) gives:
+    #   x = -(-0.4) + 0.15 = 0.55
     #   y = -(-0.2)        = 0.20
-    #   z =   1.0   + 0.1  = 1.10
+    #   z =   -0.7  + 0.45 = -0.25
     L, R = arm.ik.solve_calls[-1]
     check("IK received 4x4 transforms",   L.shape == (4, 4) and R.shape == (4, 4))
-    check("right wrist x mapped", abs(R[0, 3] - 0.65) < 1e-6, f"got R[0,3]={R[0,3]}")
+    check("right wrist x mapped", abs(R[0, 3] - 0.55) < 1e-6, f"got R[0,3]={R[0,3]}")
     check("right wrist y mapped", abs(R[1, 3] - 0.20) < 1e-6, f"got R[1,3]={R[1,3]}")
-    check("right wrist z mapped", abs(R[2, 3] - 1.10) < 1e-6, f"got R[2,3]={R[2,3]}")
+    check("right wrist z mapped", abs(R[2, 3] + 0.25) < 1e-6, f"got R[2,3]={R[2,3]}")
 finally:
     arm.close()
 

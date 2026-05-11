@@ -191,9 +191,9 @@ def _decode_joy_json(payload: bytes) -> Optional[Joy]:
 # WebXR xr_origin frame (what the frontend emits): +x right, +y up, -z forward.
 # Robot torso IK frame (ROS convention):            +x forward, +y left, +z up.
 #
-# The mapping below is an identity calibration: robot_x = -xr_z, robot_y = -xr_x,
-# robot_z = xr_y. It gets you in-the-ballpark poses without a per-user recenter —
-# refine with a per-operator calibration step when needed.
+# The mapping below changes basis only: robot_x = -xr_z, robot_y = -xr_x,
+# robot_z = xr_y. IK targets should use controller positions relative to a
+# nearby XR reference pose, not absolute local-floor coordinates.
 
 _XR_TO_ROBOT_R = np.array([
     [ 0.0,  0.0, -1.0],
@@ -297,11 +297,17 @@ def _quat_to_rot(q: np.ndarray) -> np.ndarray:
     ])
 
 
-def pose_to_robot_tf(p: Pose, origin_offset: np.ndarray) -> np.ndarray:
-    """WebXR PoseStamped → 4x4 homogeneous transform in the robot torso frame."""
+def pose_to_robot_tf(p: Pose, origin_offset: np.ndarray, reference: Optional[Pose] = None) -> np.ndarray:
+    """WebXR PoseStamped -> 4x4 transform in the robot torso frame.
+
+    When a reference pose is provided, only the controller position delta is
+    mapped into the robot frame. The orientation remains the controller's
+    mapped WebXR orientation; it is not made relative to the reference.
+    """
     R_local = _quat_to_rot(p.quat)
     R = _XR_TO_ROBOT_R @ R_local @ _XR_TO_ROBOT_R.T
-    t = _XR_TO_ROBOT_R @ p.pos + origin_offset
+    pos = p.pos - reference.pos if reference is not None else p.pos
+    t = _XR_TO_ROBOT_R @ pos + origin_offset
     tf = np.eye(4)
     tf[:3, :3] = R
     tf[:3, 3] = t
@@ -373,6 +379,7 @@ class PoseBuffer:
     head: Optional[Pose] = None
     left_t: float = 0.0
     right_t: float = 0.0
+    head_t: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -429,6 +436,7 @@ class ArmDriver:
         self._origin = origin_offset
         self._buf = buf
         self._stop = threading.Event()
+        self._last_head_warn = 0.0
         threading.Thread(target=self._run, name="ik-loop", daemon=True).start()
 
     def _run(self) -> None:
@@ -437,14 +445,22 @@ class ArmDriver:
         while not self._stop.is_set():
             t0 = time.monotonic()
             with self._buf.lock:
-                lp, rp = self._buf.left, self._buf.right
-                lt, rt = self._buf.left_t, self._buf.right_t
+                lp, rp, hp = self._buf.left, self._buf.right, self._buf.head
+                lt, rt, ht = self._buf.left_t, self._buf.right_t, self._buf.head_t
             if lp is not None and rp is not None:
                 now = time.monotonic()
                 if now - lt < self._max_age and now - rt < self._max_age:
+                    if hp is None or now - ht >= self._max_age:
+                        if now - self._last_head_warn > 2.0:
+                            log.warning("IK waiting for fresh /head_pose before mapping XR controller targets")
+                            self._last_head_warn = now
+                        dt = time.monotonic() - t0
+                        if dt < period:
+                            time.sleep(period - dt)
+                        continue
                     try:
-                        L = pose_to_robot_tf(lp, self._origin)
-                        R = pose_to_robot_tf(rp, self._origin)
+                        L = pose_to_robot_tf(lp, self._origin, reference=hp)
+                        R = pose_to_robot_tf(rp, self._origin, reference=hp)
                         q = self.ctrl.get_current_dual_arm_q()
                         dq = self.ctrl.get_current_dual_arm_dq()
                         sol_q, sol_tauff = self.ik.solve_ik(L, R, q, dq)
@@ -730,10 +746,10 @@ def main() -> int:
                    help="IK / arm control loop rate")
     p.add_argument("--pose-max-age-s", type=float, default=0.2,
                    help="Skip IK step if either wrist pose is older than this")
-    p.add_argument("--origin-offset", type=float, nargs=3, default=[0.25, 0.0, 0.1],
+    p.add_argument("--origin-offset", type=float, nargs=3, default=[0.15, 0.0, 0.45],
                    metavar=("X", "Y", "Z"),
-                   help="Additive offset (metres, robot frame) applied to XR poses "
-                        "— shifts the operator 'neutral' point into the robot's arm workspace")
+                   help="Additive offset (metres, robot frame) applied to head-relative "
+                        "XR controller poses")
 
     # hand / finger tracking (opt-in)
     p.add_argument("--enable-hands", action="store_true",
@@ -828,7 +844,7 @@ def main() -> int:
                 elif inner_topic.endswith("/right") or inner_topic == "/controller/right":
                     pose_buf.right = pose; pose_buf.right_t = now
                 elif "head" in inner_topic:
-                    pose_buf.head = pose
+                    pose_buf.head = pose; pose_buf.head_t = now
             return
 
         if mtype == "sensor_msgs/msg/Joy":
