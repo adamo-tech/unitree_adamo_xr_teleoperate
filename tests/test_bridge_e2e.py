@@ -640,6 +640,117 @@ expect_error("ros=/topic",                   "source must be one of")   # ROS re
 
 
 # ---------------------------------------------------------------------------
+# 5'''') Degenerate-pose guard (lost-tracking identity frames)
+# ---------------------------------------------------------------------------
+#
+# When the headset momentarily loses hand tracking, WebXR returns null joint
+# poses; older frontends still published the frame with every joint filled
+# with the identity pose at the xr_origin. pose_is_degenerate() is the
+# bridge-side guard that keeps those frames from commanding the arms to the
+# origin-offset point (the "arms rapidly reset then resume" bug).
+
+print("\n[5''''] Degenerate pose guard")
+
+UNIT_QUAT = np.array([0.0, 0.0, 0.0, 1.0])
+
+check("identity-at-origin is degenerate",
+      bridge.pose_is_degenerate(np.zeros(3), UNIT_QUAT))
+check("zero quaternion is degenerate",
+      bridge.pose_is_degenerate(np.array([0.3, 1.2, -0.5]), np.zeros(4)))
+check("NaN position is degenerate",
+      bridge.pose_is_degenerate(np.array([np.nan, 1.2, -0.5]), UNIT_QUAT))
+check("real tracked pose is NOT degenerate",
+      not bridge.pose_is_degenerate(np.array([0.3, 1.2, -0.5]), UNIT_QUAT))
+check("1 mm from origin is NOT degenerate",
+      not bridge.pose_is_degenerate(np.array([0.001, 0.0, 0.0]), UNIT_QUAT))
+
+# on_xr-level: mirror the production dispatch (guard included) and assert that
+# identity-fill frames leave both buffers untouched while real frames land.
+guard_pose_buf = bridge.PoseBuffer()
+guard_hand_buf = bridge.HandBuffer()
+
+def on_xr_guarded(payload: bytes) -> None:
+    env = bridge._decode_envelope(payload)
+    if env is None:
+        return
+    inner, mtype, body = env
+    if mtype == "geometry_msgs/msg/PoseStamped":
+        p = bridge._decode_posestamped_cdr(body)
+        if p is None:
+            return
+        if bridge.pose_is_degenerate(p.pos, p.quat):
+            bridge._note_dropped_pose(inner)
+            return
+        now = time.monotonic()
+        with guard_pose_buf.lock:
+            if inner.endswith("/left"):
+                guard_pose_buf.left = p; guard_pose_buf.left_t = now
+            elif inner.endswith("/right"):
+                guard_pose_buf.right = p; guard_pose_buf.right_t = now
+        return
+    if mtype == "geometry_msgs/msg/PoseArray":
+        ps = bridge._decode_posearray_cdr(body)
+        if not ps:
+            return
+        handedness = "left" if inner.endswith("/left") else "right" if inner.endswith("/right") else None
+        if handedness is None:
+            return
+        positions = np.array([p.pos for p in ps])
+        quaternions = np.array([p.quat for p in ps])
+        if bridge.pose_is_degenerate(positions[0], quaternions[0]):
+            bridge._note_dropped_pose(inner)
+            return
+        joints = bridge.HandJoints(handedness, positions, quaternions)
+        now = time.monotonic()
+        with guard_hand_buf.lock:
+            if handedness == "left":
+                guard_hand_buf.left = joints; guard_hand_buf.left_t = now
+            else:
+                guard_hand_buf.right = joints; guard_hand_buf.right_t = now
+        wrist = bridge.Pose(pos=positions[0].copy(), quat=quaternions[0].copy())
+        with guard_pose_buf.lock:
+            if handedness == "left":
+                guard_pose_buf.left = wrist; guard_pose_buf.left_t = now
+            else:
+                guard_pose_buf.right = wrist; guard_pose_buf.right_t = now
+
+# Identity wrist PoseStamped (what a lost-tracking frame carries) → dropped.
+on_xr_guarded(ros_envelope("/controller/left", "geometry_msgs/msg/PoseStamped",
+                           encode_posestamped((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))))
+check("identity controller pose dropped", guard_pose_buf.left is None)
+
+# Real pose lands.
+on_xr_guarded(ros_envelope("/controller/left", "geometry_msgs/msg/PoseStamped",
+                           encode_posestamped((0.2, 1.0, -0.4), (0.0, 0.0, 0.0, 1.0))))
+check("real controller pose accepted", guard_pose_buf.left is not None)
+
+# A later identity frame must not overwrite the real one (timestamp included —
+# a refreshed left_t would defeat the ArmDriver staleness guard).
+t_before = guard_pose_buf.left_t
+on_xr_guarded(ros_envelope("/controller/left", "geometry_msgs/msg/PoseStamped",
+                           encode_posestamped((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))))
+check("identity pose does not overwrite real pose",
+      guard_pose_buf.left is not None and np.allclose(guard_pose_buf.left.pos, [0.2, 1.0, -0.4]))
+check("identity pose does not refresh timestamp", guard_pose_buf.left_t == t_before)
+
+# Identity-fill hand PoseArray (all 25 joints at origin) → whole frame dropped
+# from both the hand buffer and the spliced wrist pose buffer.
+IDENTITY_HAND = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))] * 25
+on_xr_guarded(ros_envelope("/hand/right", "geometry_msgs/msg/PoseArray",
+                           encode_posearray(IDENTITY_HAND)))
+check("identity hand frame dropped (hand_buf)", guard_hand_buf.right is None)
+check("identity hand frame dropped (pose_buf)", guard_pose_buf.right is None)
+
+# Real hand frame lands in both buffers.
+real_hand = [((-0.31, 1.18, -0.64), (0.0, 0.0, 0.0, 1.0))] + SYNTH_HAND_POSES[1:]
+on_xr_guarded(ros_envelope("/hand/right", "geometry_msgs/msg/PoseArray",
+                           encode_posearray(real_hand)))
+check("real hand frame accepted (hand_buf)", guard_hand_buf.right is not None)
+check("real hand frame accepted (pose_buf wrist splice)",
+      guard_pose_buf.right is not None and np.allclose(guard_pose_buf.right.pos, [-0.31, 1.18, -0.64]))
+
+
+# ---------------------------------------------------------------------------
 # 5) Full loop through the Adamo routers (real Zenoh transport)
 # ---------------------------------------------------------------------------
 #

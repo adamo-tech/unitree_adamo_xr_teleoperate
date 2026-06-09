@@ -297,6 +297,41 @@ def _quat_to_rot(q: np.ndarray) -> np.ndarray:
     ])
 
 
+def pose_is_degenerate(pos: np.ndarray, quat: np.ndarray) -> bool:
+    """True for poses that can't be real tracking data and must be dropped.
+
+    When the headset momentarily loses hand tracking, WebXR returns null joint
+    poses; frontends that still publish that frame substitute the identity
+    pose — position exactly at the xr_origin (the floor at session start).
+    Feeding that through arm IK snaps both arms to the origin-offset point and
+    back once tracking resumes. A real tracked wrist is never at the exact
+    origin, so drop those frames and let the staleness guard treat the loss
+    like the data gap it is. Also rejects non-finite values and zero-norm
+    (garbage) quaternions.
+    """
+    if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat))):
+        return True
+    if float(np.dot(pos, pos)) < 1e-8:    # within 0.1 mm of the exact origin
+        return True
+    if float(np.dot(quat, quat)) < 0.25:  # unit quaternion expected
+        return True
+    return False
+
+
+_dropped_poses = {"count": 0, "last_log_t": 0.0}
+
+
+def _note_dropped_pose(topic: str) -> None:
+    """Rate-limited (1/s) accounting of dropped degenerate poses."""
+    _dropped_poses["count"] += 1
+    now = time.monotonic()
+    if now - _dropped_poses["last_log_t"] >= 1.0:
+        log.warning("dropped %d degenerate XR pose(s) — tracking lost? latest: %s",
+                    _dropped_poses["count"], topic)
+        _dropped_poses["count"] = 0
+        _dropped_poses["last_log_t"] = now
+
+
 def pose_to_robot_tf(p: Pose, origin_offset: np.ndarray, reference: Optional[Pose] = None) -> np.ndarray:
     """WebXR PoseStamped -> 4x4 transform in the robot torso frame.
 
@@ -435,6 +470,7 @@ class ArmDriver:
         self._max_age = pose_max_age_s
         self._origin = origin_offset
         self._buf = buf
+        self._last_ik_t = 0.0
         self._stop = threading.Event()
         self._last_head_warn = 0.0
         threading.Thread(target=self._run, name="ik-loop", daemon=True).start()
@@ -458,6 +494,15 @@ class ArmDriver:
                         if dt < period:
                             time.sleep(period - dt)
                         continue
+                    gap = now - self._last_ik_t
+                    if self._last_ik_t and gap > max(0.5, self._max_age):
+                        # Tracking resumed after a dropout (wrist or head): the
+                        # operator's hands may have moved while the arms held
+                        # position, so re-run the controller's velocity ramp to
+                        # soften the catch-up.
+                        log.info("XR poses resumed after %.2fs gap — re-ramping arm speed", gap)
+                        self.ctrl.speed_gradual_max()
+                    self._last_ik_t = now
                     try:
                         L = pose_to_robot_tf(lp, self._origin, reference=hp)
                         R = pose_to_robot_tf(rp, self._origin, reference=hp)
@@ -837,6 +882,9 @@ def main() -> int:
             pose = _decode_posestamped_cdr(body)
             if pose is None:
                 return
+            if pose_is_degenerate(pose.pos, pose.quat):
+                _note_dropped_pose(inner_topic)
+                return
             now = time.monotonic()
             with pose_buf.lock:
                 if inner_topic.endswith("/left") or inner_topic == "/controller/left":
@@ -879,6 +927,12 @@ def main() -> int:
             # consumers should index joints by position and handle short arrays.
             positions = np.array([p.pos for p in poses])
             quaternions = np.array([p.quat for p in poses])
+            # The wrist (joint 0) anchors both the finger retargeting frame and
+            # the arm-IK splice below — a degenerate wrist means the whole hand
+            # frame is the lost-tracking identity fill. Drop it.
+            if pose_is_degenerate(positions[0], quaternions[0]):
+                _note_dropped_pose(inner_topic)
+                return
             joints = HandJoints(
                 handedness=handedness,
                 positions=positions,
